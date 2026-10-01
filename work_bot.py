@@ -183,8 +183,9 @@ class WorkBotDB:
         conn.commit()
         conn.close()
 
-    def add_document(self, user_id: int, doc_type: str, file_ref: str, data: dict):
-        """Распознанный документ → таблица documents (поля без raw_text)."""
+    def add_document(self, user_id: int, doc_type: str, file_ref: str, data: dict) -> int:
+        """Распознанный документ → таблица documents (поля без raw_text).
+        Возвращает id записи — номер подтверждения пользователю."""
         payload = {k: v for k, v in (data or {}).items()
                    if k != "raw_text" and v not in (None, "")}
         conn = sqlite3.connect(self.db_path)
@@ -193,8 +194,46 @@ class WorkBotDB:
             "INSERT INTO documents (user_id, doc_type, file_ref, data) VALUES (?, ?, ?, ?)",
             (user_id, doc_type, file_ref or "", json.dumps(payload, ensure_ascii=False))
         )
+        row_id = cursor.lastrowid
         conn.commit()
         conn.close()
+        return row_id
+
+    def get_my_documents(self, user_id: int, limit: int = 10) -> list:
+        """Последние распознанные документы одного пользователя."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, created_at, doc_type, data
+            FROM documents WHERE user_id = ? ORDER BY id DESC LIMIT ?
+        """, (user_id, limit))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    def format_my_documents(self, user_id: int) -> str:
+        """Короткий список своих документов: №, тип, дата, номер и стороны."""
+        rows = self.get_my_documents(user_id)
+        if not rows:
+            return "Твоих документов в таблице пока нет — отправь фото или PDF."
+        lines = ["📚 Твои распознанные документы:"]
+        for doc_id, created_at, doc_type, data_json in rows:
+            data = json.loads(data_json or "{}")
+            num = ("bl_number" in data and data["bl_number"]) or \
+                  ("invoice_number" in data and data["invoice_number"]) or \
+                  ("packing_list_number" in data and data["packing_list_number"]) or ""
+            side = data.get("shipper") or data.get("shipper_name") or ""
+            if not side:
+                side = data.get("consignee") or data.get("consignee_name") or ""
+            title = DOC_TYPE_NAMES.get(doc_type, doc_type)
+            line = f"№{doc_id} · {title}"
+            if num:
+                line += f" · {num}"
+            if side:
+                line += f" · {side}"
+            line += f" · {str(created_at)[5:16]}"
+            lines.append(line)
+        return "\n".join(lines)
 
     def get_documents(self, limit: int = 50) -> list:
         """Последние распознанные документы (свежие первыми)."""
@@ -514,7 +553,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text += "  /stats — статус базы ВЭД\n"
     text += "  /ask &lt;вопрос&gt; — разовый вопрос по базе ВЭД\n"
     text += "  /clear — очистить историю диалога\n"
-    text += "  /top N — искать по N источникам (1–20)\n\n"
+    text += "  /top N — искать по N источникам (1–20)\n"
+    text += "  /mydocs — мои документы в таблице (последние 10)\n\n"
     text += "<b>Таблица документов (оператор):</b>\n"
     text += "  /docs — сколько документов распознано и по типам\n"
     text += "  /docs_csv — выгрузка таблицы CSV-файлом\n\n"
@@ -707,8 +747,11 @@ async def handle_document_photo(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
         db = WorkBotDB()
-        db.add_document(user_id, doc_type, f"photo:{photo.file_id}", data)
+        doc_rec_no = db.add_document(user_id, doc_type, f"photo:{photo.file_id}", data)
         db.log_interaction(user_id, "document", f"photo:{photo.file_id}", doc_type)
+        await update.message.reply_text(
+            "✅ Записано в таблицу распознанных документов, запись "
+            f"№{doc_rec_no}. Посмотреть свои: /mydocs")
 
     except Exception as e:
         logger.error(f"Document OCR error: {e}", exc_info=True)
@@ -903,8 +946,11 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
         db = WorkBotDB()
-        db.add_document(user_id, doc_type, f"doc:{filename}", data)
+        doc_rec_no = db.add_document(user_id, doc_type, f"doc:{filename}", data)
         db.log_interaction(user_id, "document", f"doc:{filename}", doc_type)
+        await update.message.reply_text(
+            "✅ Записано в таблицу распознанных документов, запись "
+            f"№{doc_rec_no}. Посмотреть свои: /mydocs")
 
     except Exception as e:
         logger.error(f"Document error: {e}", exc_info=True)
@@ -1155,6 +1201,11 @@ def _is_bot_admin(user_id: str) -> bool:
     return user_id in admins
 
 
+async def mydocs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Свои распознанные документы — каждому пользователю, только сам себе."""
+    await update.message.reply_text(WorkBotDB().format_my_documents(update.effective_user.id))
+
+
 async def docs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Сводка по таблице распознанных документов — оператору."""
     if not _is_bot_admin(str(update.effective_user.id)):
@@ -1389,6 +1440,7 @@ def main():
     application.add_handler(CommandHandler("stats", rag_stats_cmd))
     application.add_handler(CommandHandler("docs", docs_cmd))
     application.add_handler(CommandHandler("docs_csv", docs_csv_cmd))
+    application.add_handler(CommandHandler("mydocs", mydocs_cmd))
     application.add_handler(CommandHandler("ask", rag_ask_cmd))
     application.add_handler(CommandHandler("clear", clear_cmd))
     application.add_handler(CommandHandler("top", top_cmd))
