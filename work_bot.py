@@ -1258,6 +1258,31 @@ async def rag_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(text, parse_mode="HTML")
 
 
+# ── Анти-спам: лимит RAG-вопросов на пользователя (ключ LLM не копится) ──
+RAG_RATE_LIMIT = int(os.getenv("RAG_RATE_LIMIT_PER_HOUR", "10") or "10")
+_RATE_LOG: Dict[int, list] = {}
+
+
+def _rate_ok(user_id: int) -> bool:
+    """True, если у пользователя остались действия лимита за последний час."""
+    if RAG_RATE_LIMIT <= 0:   # 0 — лимит выключен
+        return True
+    now = datetime.now().timestamp()
+    hits = [t for t in _RATE_LOG.get(user_id, []) if now - t < 3600]
+    if len(hits) >= RAG_RATE_LIMIT:
+        _RATE_LOG[user_id] = hits
+        return False
+    hits.append(now)
+    _RATE_LOG[user_id] = hits
+    return True
+
+
+def rate_limit_left(user_id: int) -> int:
+    now = datetime.now().timestamp()
+    hits = [t for t in _RATE_LOG.get(user_id, []) if now - t < 3600]
+    return max(0, RAG_RATE_LIMIT - len(hits))
+
+
 async def handle_rag_qa(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str = None) -> None:
     user_id = update.effective_user.id
     if not RAG_AVAILABLE:
@@ -1267,6 +1292,12 @@ async def handle_rag_qa(update: Update, context: ContextTypes.DEFAULT_TYPE, ques
     q = question if question is not None else update.message.text
     if not q or not q.strip():
         await update.message.reply_text("Задайте вопрос по ВЭД.")
+        return
+
+    # Лимит платных LLM-вопросов на пользователя (только RAG-запрос, не навигация)
+    if not _rate_ok(user_id):
+        await update.message.reply_text(
+            f"Лимит исчерпан: {RAG_RATE_LIMIT} вопросов в час. Попробуй позже 🙂")
         return
 
     # Загружаем/создаём сессию пользователя

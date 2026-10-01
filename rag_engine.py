@@ -95,10 +95,21 @@ EVAL_PATH = BASE_DIR / "eval_report.json"
 API_KEY = (os.getenv("API_KEY") or os.getenv("OPENROUTER_API_KEY") or "").strip()
 BASE_URL = (os.getenv("BASE_URL") or "https://dashscope-intl.aliyuncs.com/compatible-mode/v1").strip()
 EMBED_MODEL = os.getenv("RAG_EMBED_MODEL", "text-embedding-v3")
+# Провайдер эмбеддингов: dashscope (ключ API) или local (модель в контейнере,
+# без ключа и без сети — как в rag-ved-logging). Смена = переменная + /ingest.
+EMBED_PROVIDER = (os.getenv("RAG_EMBED_PROVIDER") or "dashscope").strip().lower()
+LOCAL_EMBED_MODEL = (os.getenv("RAG_LOCAL_EMBED_MODEL") or
+                     "intfloat/multilingual-e5-small").strip()
+# e5 требует префиксов; в dashscope-провайдере их нет
+DOC_PREFIX = "passage: " if EMBED_PROVIDER == "local" else ""
+QUERY_PREFIX = "query: " if EMBED_PROVIDER == "local" else ""
+# Идентификатор текущего эмбеддера: смена провайдера инвалидирует индекс
+EMBED_ID = f"{EMBED_PROVIDER}:{EMBED_MODEL if EMBED_PROVIDER != 'local' else LOCAL_EMBED_MODEL}"
+EMBED_MARKER_PATH = BASE_DIR / "embed_marker.json"
 # Генерация ответа — отдельный провайдер (DeepSeek), fallback на DashScope
 CHAT_API_KEY = (os.getenv("RAG_CHAT_API_KEY") or API_KEY or "").strip()
 CHAT_BASE_URL = (os.getenv("RAG_CHAT_BASE_URL") or BASE_URL).strip()
-CHAT_MODEL = os.getenv("RAG_CHAT_MODEL", "qwen3-vl-flash")
+CHAT_MODEL = os.getenv("RAG_CHAT_MODEL", "deepseek-chat")
 TOP_K = int(os.getenv("RAG_TOP_K", "5"))
 CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "1000"))
 CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "150"))
@@ -117,7 +128,10 @@ RERANK_MODEL = os.getenv("RAG_RERANK_MODEL", "qwen3-rerank")
 RERANK_URL = os.getenv("RAG_RERANK_URL", "https://dashscope-intl.aliyuncs.com/compatible-api/v1/reranks")
 RERANK_MIN_SCORE = float(os.getenv("RAG_RERANK_MIN_SCORE", "0.05"))
 
-RAG_AVAILABLE = bool(_FAISS_OK and _OPENAI_OK and API_KEY)
+RAG_AVAILABLE = bool(
+    _FAISS_OK and _OPENAI_OK
+    and (EMBED_PROVIDER == "local" or API_KEY)
+)
 
 # ────────────────────────── системный промпт ВЭД ──────────────────────────
 RAG_SYSTEM_PROMPT = (
@@ -189,9 +203,29 @@ def _with_retries(fn, *args, **kwargs):
 
 
 # ────────────────────────── эмбеддинги ──────────────────────────
-def _embed_batch(texts: list[str]) -> list[list[float]]:
+_st_model: Any = None
+
+
+def _get_st_model() -> Any:
+    """Локальная модель эмбеддингов (sentence-transformers), лениво."""
+    global _st_model
+    if _st_model is None:
+        from sentence_transformers import SentenceTransformer
+        logger.info(f"Загрузка локальной модели эмбеддингов {LOCAL_EMBED_MODEL}...")
+        _st_model = SentenceTransformer(LOCAL_EMBED_MODEL)
+    return _st_model
+
+
+def _embed_batch(texts: list[str], prefix: str = "") -> list[list[float]]:
     if not texts:
         return []
+    if EMBED_PROVIDER == "local":
+        model = _get_st_model()
+        prepared = [(prefix + t) if prefix else t for t in texts]
+        vectors = model.encode(prepared, batch_size=32,
+                               normalize_embeddings=False, show_progress_bar=False)
+        return [list(map(float, v)) for v in vectors]
+
     client = _get_client()
 
     def call():
@@ -410,6 +444,18 @@ def _load_store() -> None:
     global _index, _metadata, _dim
     if not _FAISS_OK:
         return
+    # Индекс векторов другого эмбеддера (смена провайдера/модели) — не данные:
+    # сбрасываем, подскажем /ingest
+    if EMBED_MARKER_PATH.exists():
+        try:
+            if json.loads(EMBED_MARKER_PATH.read_text(encoding="utf-8")) != EMBED_ID:
+                logger.warning(
+                    "RAG: эмбеддер сменился (%s) — старый индекс сброшен, "
+                    "выполните /ingest", EMBED_ID)
+                INDEX_PATH.unlink(missing_ok=True)
+                META_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
     if INDEX_PATH.exists() and META_PATH.exists():
         try:
             _index = faiss.read_index(str(INDEX_PATH))
@@ -434,6 +480,7 @@ def _save_store() -> None:
     if _index is not None:
         faiss.write_index(_index, str(INDEX_PATH))
     META_PATH.write_text(json.dumps(_metadata, ensure_ascii=False), encoding="utf-8")
+    EMBED_MARKER_PATH.write_text(EMBED_ID, encoding="utf-8")
 
 
 def _reconstruct_vector(row_idx: int) -> "np.ndarray":
@@ -507,7 +554,8 @@ def ingest(verbose: bool = False) -> dict:
             logger.error(f"RAG ingest {name}: {e}", exc_info=True)
 
     if new_chunks:
-        vecs = _embed_all([c["text"] for c in new_chunks])
+        vecs = _embed_all([(DOC_PREFIX + c["text"]) if DOC_PREFIX else c["text"]
+                           for c in new_chunks])
         dim = len(vecs[0])
         if keep_vecs and int(keep_vecs[0].shape[0]) != dim:
             logger.warning("RAG: размерность изменилась — полная переиндексация")
@@ -568,7 +616,8 @@ def _full_reindex(current: dict[str, Path], errors: list[str]) -> dict:
         except Exception as e:
             errors.append(f"{name}: {e}")
     if all_chunks:
-        vecs = _embed_all([c["text"] for c in all_chunks])
+        vecs = _embed_all([(DOC_PREFIX + c["text"]) if DOC_PREFIX else c["text"]
+                           for c in all_chunks])
         dim = len(vecs[0])
         arr = _normalize(np.array(vecs, dtype="float32"))
         _index = faiss.IndexFlatIP(dim)
@@ -605,7 +654,7 @@ def _save_manifest(current: dict[str, Path]) -> None:
 def get_stats() -> dict:
     if not RAG_AVAILABLE:
         return {"available": False, "empty": True, "collection_count": 0, "files": [],
-                "models": {"embed": EMBED_MODEL, "chat": CHAT_MODEL,
+                "models": {"embed": EMBED_ID, "chat": CHAT_MODEL,
                            "rerank": RERANK_MODEL if RERANK_ON else None},
                 "bm25": _BM25_OK, "rerank_on": RERANK_ON,
                 "docs_dir": str(DOCS_DIR)}
@@ -621,7 +670,7 @@ def get_stats() -> dict:
             pass
     return {
         "available": True, "empty": count == 0, "collection_count": count, "files": files,
-        "models": {"embed": EMBED_MODEL, "chat": CHAT_MODEL,
+        "models": {"embed": EMBED_ID, "chat": CHAT_MODEL,
                    "rerank": RERANK_MODEL if RERANK_ON else None},
         "bm25": _BM25_OK and _bm25 is not None, "rerank_on": RERANK_ON,
         "docs_dir": str(DOCS_DIR),
@@ -639,7 +688,7 @@ def _hybrid_retrieve(query: str, k: int) -> list[dict]:
     pool = CANDIDATE_POOL
 
     # dense
-    q_vec = _embed_batch([query])[0]
+    q_vec = _embed_batch([(QUERY_PREFIX + query) if QUERY_PREFIX else query])[0]
     q_arr = _normalize(np.array([q_vec], dtype="float32"))
     sims, ids = _index.search(q_arr, pool)
     dense_rank: dict[int, int] = {int(idx): r for r, idx in enumerate(ids[0]) if idx >= 0}
