@@ -1,0 +1,13 @@
+python-telegram-bot
+python-dotenv
+requests
+Pillow
+pytesseract
+opencv-python-headless
+numpy
+pdf2image
+PyPDF2
+pypdf
+openai
+faiss-cpu
+rank_bm25

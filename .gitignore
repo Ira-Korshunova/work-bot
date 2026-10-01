@@ -1,0 +1,21 @@
+.env
+.env.*
+!deploy/.env.example
+__pycache__/
+*.pyc
+*.db
+*.log
+*.pid
+.DS_Store
+products.csv
+report.html
+samples/
+screens*/
+screenshots/
+storage/
+copy_ДЗмод4_3_vision/
+wdtest.txt
+*.out
+*.err
+\ screens_new/
+Отчёт_*
