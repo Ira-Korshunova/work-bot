@@ -12,3 +12,5 @@ openai
 faiss-cpu
 rank_bm25
 sentence-transformers
+vosk
+omegaconf

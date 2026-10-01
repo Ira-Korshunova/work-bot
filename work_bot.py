@@ -24,6 +24,7 @@ import csv
 import json
 import asyncio
 import logging
+import subprocess
 import tempfile
 import sqlite3
 from pathlib import Path
@@ -424,6 +425,91 @@ class YandexSpeechKit:
             raise RuntimeError(f"TTS error {response.status_code}: {response.text}")
 
 
+# ── Локальный голос (бесплатно, офлайн): STT — Vosk, TTS — Silero ──
+VOSK_MODEL_PATH = os.getenv("VOSK_MODEL_PATH", "").strip()
+SILERO_SPEAKER = os.getenv("SILERO_SPEAKER", "xenia")
+
+
+class LocalSpeech:
+    """STT (Vosk) и TTS (Silero) локально — без API-ключей и облака."""
+
+    _vosk_model = None
+    _silero_model = None
+
+    @staticmethod
+    def _ffmpeg(args: list, input_bytes: bytes) -> bytes:
+        proc = subprocess.run(["ffmpeg", "-loglevel", "error", *args],
+                              input=input_bytes, capture_output=True)
+        if proc.returncode != 0:
+            raise RuntimeError("ffmpeg: " + proc.stderr.decode(errors="ignore")[-300:])
+        return proc.stdout
+
+    def stt(self, audio_bytes: bytes, lang: str = "ru-RU") -> str:
+        import io
+        import wave
+        import json as _json
+        from vosk import Model, KaldiRecognizer
+
+        if not VOSK_MODEL_PATH or not os.path.isdir(VOSK_MODEL_PATH):
+            raise RuntimeError("Vosk-модель не найдена (VOSK_MODEL_PATH)")
+        wav = self._ffmpeg(["-i", "pipe:0", "-ar", "16000", "-ac", "1", "-f", "wav", "pipe:1"],
+                           audio_bytes)
+
+        if LocalSpeech._vosk_model is None:
+            LocalSpeech._vosk_model = Model(VOSK_MODEL_PATH)
+        wf = wave.open(io.BytesIO(wav))
+        rec = KaldiRecognizer(LocalSpeech._vosk_model, wf.getframerate())
+        parts = []
+        while True:
+            data = wf.readframes(4000)
+            if not data:
+                break
+            if rec.AcceptWaveform(data):
+                parts.append(_json.loads(rec.Result()).get("text", ""))
+        parts.append(_json.loads(rec.FinalResult()).get("text", ""))
+        return " ".join(p for p in parts if p).strip()
+
+    def _get_silero(self):
+        if LocalSpeech._silero_model is None:
+            import torch
+            try:
+                model, _ = torch.hub.load("snakers4/silero-models", "silero_tts",
+                                          language="ru", speaker="v5_ru", trust_repo=True)
+            except Exception:
+                model, _ = torch.hub.load("snakers4/silero-models", "silero_tts",
+                                          language="ru", speaker="v4_ru", trust_repo=True)
+            LocalSpeech._silero_model = model
+        return LocalSpeech._silero_model
+
+    def tts(self, text: str) -> bytes:
+        import io
+        import wave
+        import torch
+
+        model = self._get_silero()
+        audio = model.apply_tts(text=text, speaker=SILERO_SPEAKER,
+                                sample_rate=24000, put_accent=True, put_yo=True)
+        pcm = (audio.numpy() * 32767).astype("int16")
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(24000)
+            wf.writeframes(pcm.tobytes())
+        return self._ffmpeg(["-i", "pipe:0", "-c:a", "libopus", "-b:a", "48k", "-f", "ogg", "pipe:1"],
+                            buf.getvalue())
+
+
+def get_speech():
+    """Текущий движок речи: локальный (Vosk/Silero) при наличии модели, иначе SpeechKit, иначе None."""
+    if VOSK_MODEL_PATH and os.path.isdir(VOSK_MODEL_PATH):
+        return LocalSpeech()
+    if YANDEX_API_KEY:
+        return YandexSpeechKit(YANDEX_API_KEY)
+    return None
+
+
 # ── Утилиты ──
 def format_document_result(doc_type: str, data: dict) -> str:
     """Форматирование результата OCR в HTML"""
@@ -561,7 +647,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text += "<b>Статус агентов:</b>\n"
     text += f"  {'✅' if DOC_AGENT_AVAILABLE else '⚠️'} Документы (OCR)\n"
     text += f"  {'✅' if VISION_AGENT_AVAILABLE else '⚠️'} Товары (Vision)\n"
-    text += f"  {'✅' if YANDEX_API_KEY else '⚠️'} Голос (Yandex SpeechKit)\n"
+    _speech = get_speech()
+    _speech_label = ("локальный (Vosk/Silero)" if isinstance(_speech, LocalSpeech)
+                     else "Yandex SpeechKit" if _speech else "не настроен")
+    text += f"  {'✅' if _speech else '⚠️'} Голос: {_speech_label}\n"
     text += f"  {'✅' if RAG_AVAILABLE else '⚠️'} База ВЭД (RAG)\n\n"
     text += "<i>Если кнопки пропали — отправьте /start</i>"
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_main_keyboard())
@@ -976,10 +1065,11 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = update.effective_user.id
     logger.info(f"🎤 VOICE received from user {user_id}, voice_id={update.message.voice.file_id if update.message.voice else 'none'}")
 
-    if not YANDEX_API_KEY:
+    speech = get_speech()
+    if speech is None:
         await update.message.reply_text(
             "❌ Голосовые функции недоступны.\n"
-            "Добавьте YANDEX_API_KEY в .env файл.\n"
+            "Добавьте VOSK_MODEL_PATH (локальная модель) или YANDEX_API_KEY в .env файл.\n"
             "Ключ можно получить в Yandex Cloud: https://cloud.yandex.ru/"
         )
         return
@@ -997,22 +1087,18 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         with open(tmp_path, "rb") as f:
             audio_bytes = f.read()
 
-        speech = YandexSpeechKit(YANDEX_API_KEY)
+        speech = get_speech()
         text = await asyncio.to_thread(speech.stt, audio_bytes)
 
         await update.message.reply_text(
             f"📝 <b>Распознано:</b>\n<i>{text}</i>\n\n"
-            f"Напишите текст — я озвучу его.",
+            f"Ищу ответ по базе ВЭД…",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(),
         )
 
-        session = session_manager.get_session(user_id) or session_manager.get_or_create_session(user_id)
-        session.state = "voice"
-        session.set_metadata("last_text", text)
-
-        db = WorkBotDB()
-        db.log_interaction(user_id, "voice_stt", f"voice:{voice.file_id}", text[:200])
+        # Распознанный текст уходит в базу ВЭД, ответ — текстом и голосом.
+        await handle_rag_qa(update, context, question=text, voice_reply=True)
 
     except Exception as e:
         logger.error(f"STT error: {e}", exc_info=True)
@@ -1030,8 +1116,9 @@ async def handle_tts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     user_id = update.effective_user.id
     text = update.message.text
 
-    if not YANDEX_API_KEY:
-        await update.message.reply_text("❌ YANDEX_API_KEY не настроен.")
+    speech = get_speech()
+    if speech is None:
+        await update.message.reply_text("❌ Голосовые функции недоступны (модель не настроена).")
         return
 
     if not text.strip():
@@ -1040,7 +1127,7 @@ async def handle_tts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("🔊 Синтезирую речь...")
 
     try:
-        speech = YandexSpeechKit(YANDEX_API_KEY)
+        speech = speech or get_speech()
         audio = await asyncio.to_thread(speech.tts, text[:1000])  # ограничение по длине
 
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
@@ -1283,7 +1370,8 @@ def rate_limit_left(user_id: int) -> int:
     return max(0, RAG_RATE_LIMIT - len(hits))
 
 
-async def handle_rag_qa(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str = None) -> None:
+async def handle_rag_qa(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str = None,
+                        voice_reply: bool = False) -> None:
     user_id = update.effective_user.id
     if not RAG_AVAILABLE:
         await update.message.reply_text(
@@ -1379,6 +1467,21 @@ async def handle_rag_qa(update: Update, context: ContextTypes.DEFAULT_TYPE, ques
     footer = f"\n\n<i>Метод: {method_tag} • Источников в контексте: {len(sources)} • Не является юридической консультацией.</i>"
     text = f"📚 <b>Ответ по базе ВЭД</b>\n\n{answer}{src_block}{footer}"
     await _send_long(msg, update, text)
+
+    # Голосовой ответ (сценарий «спросил голосом — услышал ответ»)
+    if voice_reply:
+        _speech = get_speech()
+        if _speech is not None:
+            try:
+                audio = await asyncio.to_thread(_speech.tts, answer[:1000])
+                with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                    tmp.write(audio)
+                    tmp_path = tmp.name
+                with open(tmp_path, "rb") as voice_file:
+                    await update.message.reply_voice(voice=voice_file)
+                os.unlink(tmp_path)
+            except Exception as e:
+                logger.error(f"Voice reply error: {e}", exc_info=True)
 
     # Сохраняем вопрос и ответ в историю
     session.add_message("user", q.strip())
