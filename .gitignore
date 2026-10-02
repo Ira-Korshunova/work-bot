@@ -19,3 +19,10 @@ wdtest.txt
 *.err
 \ screens_new/
 Отчёт_*
+
+# Индексные артефакты RAG — генерируются на сервере, в git не заезжают
+# (старый индекс в git = несовместимая размерность при смене эмбеддера)
+rag_data/faiss_index.bin
+rag_data/metadata.json
+rag_data/manifest.json
+rag_data/embed_marker.json

@@ -496,6 +496,18 @@ def ingest(verbose: bool = False) -> dict:
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
     _load_store()
 
+    # Маркер эмбеддера (отсутствует или не совпал), а в памяти уже загружен
+    # чужой индекс → инкрементальная ветка скопирует векторы старой
+    # размерности, и поиск упрётся в assert faiss. Дропаем старый индекс:
+    # все файлы пройдут как «новые» и переиндексируются под текущий EMBED_ID.
+    _marker = None
+    if EMBED_MARKER_PATH.exists():
+        _marker = EMBED_MARKER_PATH.read_text(encoding="utf-8").strip()
+    if _index is not None and _marker != EMBED_ID:
+        logger.warning("RAG: эмбеддер изменился (маркер: %s) — полная "
+                       "переиндексация под %s", _marker, EMBED_ID)
+        _index, _metadata, _dim = None, [], None
+
     exts = {".txt", ".md", ".pdf"}
     current: dict[str, Path] = {p.name: p for p in DOCS_DIR.iterdir()
                                 if p.is_file() and p.suffix.lower() in exts}
