@@ -721,6 +721,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await handle_rag_qa(update, context)
         return
 
+    # Режим «Пополнить базу» — ждём файл, а не текст
+    if session.state == "rag_upload":
+        await update.message.reply_text(
+            "📥 В этом режиме жду файл .txt или .md. Отмена — выберите любое "
+            "действие в меню ниже 👇")
+        return
+
     # Если режим голоса и пришёл текст — озвучиваем
     if session.state == "voice":
         await handle_tts(update, context)
@@ -935,6 +942,12 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     document = update.message.document
 
     if not document:
+        return
+
+    # Режим «Пополнить базу»: файл — в общий источник, не в OCR
+    if session_manager.get_or_create_session(user_id).state == "rag_upload":
+        await handle_rag_upload(update, context, document,
+                                session_manager.get_or_create_session(user_id))
         return
 
     # Проверяем расширение
@@ -1159,6 +1172,7 @@ def rag_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Индексировать базу", callback_data="rag_ingest"),
          InlineKeyboardButton("📊 Статус базы", callback_data="rag_stats")],
+        [InlineKeyboardButton("📥 Пополнить базу", callback_data="rag_add")],
         [InlineKeyboardButton("❌ Выйти из режима", callback_data="rag_exit")],
     ])
 
@@ -1181,6 +1195,22 @@ async def rag_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if not RAG_AVAILABLE:
         await q.edit_message_text("❌ RAG-модуль недоступен. Проверьте API_KEY/BASE_URL и библиотеки.")
+        return
+
+    if data == "rag_add":
+        if not _is_bot_admin(str(user_id)):
+            await q.edit_message_text(
+                "❌ Пополнить базу может только оператор бота. "
+                "Поиск по базе — просто пишите вопрос в этом режиме.")
+            return
+        session_manager.get_or_create_session(user_id).state = "rag_upload"
+        await q.edit_message_text(
+            "📥 <b>Пополнение базы</b>\n\n"
+            "Отправьте файл <b>.txt</b> или <b>.md</b> (до 2 МБ) следующим сообщением — "
+            "сохраню его в общий источник документов и сразу проиндексирую.\n\n"
+            "Отменить — любой пункт основного меню.",
+            parse_mode="HTML",
+            reply_markup=rag_inline_keyboard())
         return
 
     if data == "rag_ingest":
@@ -1215,8 +1245,8 @@ async def rag_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if stats.get("empty"):
             await q.edit_message_text(
                 "📚 <b>База ВЭД пуста.</b>\n\n"
-                f"Положите документы (.txt/.md/.pdf) в:\n<code>{stats['docs_dir']}</code>\n"
-                "и нажмите «🔄 Индексировать базу».",
+                "📥 <b>Пополнить базу</b> — файл .txt/.md прямо в чат, он сохранится и "
+                f"проиндексируется. Файлы на сервере лежат в <code>{stats['docs_dir']}</code>.",
                 parse_mode="HTML", reply_markup=rag_inline_keyboard())
             return
         files = "\n".join(f"  • {f['name']} — {f['chunks']} чанков" for f in stats.get("files", [])) or "  (нет)"
@@ -1278,6 +1308,82 @@ async def rag_ingest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     WorkBotDB().log_interaction(user_id, "rag_ingest", "", str(result['total_chunks']))
 
 
+# ── Пополнение базы ВЭД файлом из чата (только оператор) ──
+RAG_UPLOAD_MAX_BYTES = 2 * 1024 * 1024
+RAG_UPLOAD_EXTS = {".txt", ".md"}
+
+
+async def handle_rag_upload(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                            document: "object", session) -> None:
+    """Файл .txt/.md в режиме «Пополнить базу»: сохраняется в общий источник
+    документов (той же папке, что у веб-ассистента) и сразу индексируется."""
+    user_id = update.effective_user.id
+    target = None
+    try:
+        if not _is_bot_admin(str(user_id)):
+            session.state = "rag"
+            await update.message.reply_text(
+                "❌ Пополнить базу может только оператор бота.")
+            return
+
+        name = Path(document.file_name or "").name.strip()
+        ext = Path(name).suffix.lower()
+        if not name or ext not in RAG_UPLOAD_EXTS:
+            session.state = "rag"
+            await update.message.reply_text(
+                "❌ Принимаю только .txt и .md — такие же правила у веб-панели "
+                "ассистента, чтобы база оставалась общей.")
+            return
+        if (document.file_size or 0) > RAG_UPLOAD_MAX_BYTES:
+            session.state = "rag"
+            await update.message.reply_text(
+                "❌ Файл больше 2 МБ — для базы конспектов этого больше, чем нужно.")
+            return
+
+        target = rag_engine.DOCS_DIR / name
+        if target.exists():
+            session.state = "rag"
+            await update.message.reply_text(
+                f"❌ Файл «{name}» уже есть в источниках базы. "
+                "Загрузите под другим именем или сначала удалите старый с сервера.")
+            return
+
+        rag_engine.DOCS_DIR.mkdir(parents=True, exist_ok=True)
+        await update.message.reply_text(f"📤 Сохраняю «{name}» и индексирую…")
+
+        file = await context.bot.get_file(document.file_id)
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            await file.download_to_drive(tmp.name)
+            tmp_path = tmp.name
+        os.replace(tmp_path, target)
+
+        result = await asyncio.to_thread(rag_engine.ingest, True)
+    except Exception as e:
+        logger.error(f"RAG upload error: {e}", exc_info=True)
+        try:
+            if target is not None:
+                os.unlink(target)  # битый/необрабатываемый файл не оставляем в источнике
+        except Exception:
+            pass
+        session.state = "rag"
+        await update.message.reply_text(
+            f"❌ Не удалось загрузить «{name}» в базу: {e}")
+        return
+
+    session.state = "rag"
+    text = (
+        f"✅ <b>Документ «{name}» в базе</b>\n\n"
+        f"🆕 Добавлено чанков: {result['added']}\n"
+        f"🧩 Всего чанков: {result['total_chunks']}\n\n"
+        "Теперь можно спросить — я отвечу уже по новой базе."
+    )
+    errs = result.get("errors") or []
+    if errs:
+        text += "\n\n<b>Ошибки:</b>\n" + "\n".join(f"  • {e}" for e in errs)
+    await update.message.reply_text(text, parse_mode="HTML")
+    WorkBotDB().log_interaction(user_id, "rag_upload", name, f"+{result['added']}")
+
+
 def _is_bot_admin(user_id: str) -> bool:
     """Оператор бота: список Telegram user_id в ADMIN_USER_IDS (через запятую).
     Переменная не задана — считается режимом разработки, всё открыто."""
@@ -1329,7 +1435,7 @@ async def rag_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if stats.get("empty"):
         await update.message.reply_text(
             "📚 <b>База ВЭД пуста.</b>\n\n"
-            f"Положите документы (.txt/.md/.pdf) в:\n<code>{stats['docs_dir']}</code>\nи выполните /ingest",
+            "Нажмите «📥 Пополнить базу» — файл .txt/.md прямо в чат.",
             parse_mode="HTML")
         return
     files = "\n".join(f"  • {f['name']} — {f['chunks']} чанков" for f in stats.get("files", [])) or "  (нет)"
