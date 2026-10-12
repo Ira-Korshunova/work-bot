@@ -124,8 +124,12 @@ class DocumentExtractor:
         text = self.raw_text
         lines = text.split('\n')
         
-        # Извлекаем BL номер
-        bl_match = re.search(r'(?:BL\s+Number|B/L|Bill\s*of\s*Lading\s*Number)[\s:]*([A-Z0-9\-\/]*\d+[A-Z0-9\-\/]*)', text, re.IGNORECASE)
+        # Извлекаем BL номер. Требуем разделитель (':' или '.') после метки,
+        # чтобы 'BL' внутри самого номера ('BL2026-10078') не съедал префикс
+        bl_match = re.search(
+            r'(?:B\s*/\s*L|BL|Bill\s*of\s*Lading)\s*(?:Number|№|No[.:]?)?\s*[:.]\s*'
+            r'([A-Z0-9\-][A-Z0-9\-\/]*\d[A-Z0-9\-\/]*)',
+            text, re.IGNORECASE)
         if not bl_match:
             bl_match = re.search(r'(?:BL|B/L)[\s:]*([A-Z0-9\-\/]*\d+[A-Z0-9\-\/]*)', text, re.IGNORECASE)
         data['bl_number'] = bl_match.group(1).strip() if bl_match else None
@@ -198,7 +202,11 @@ class DocumentExtractor:
         
         # Номер рейса
         voyage_match = re.search(r'(?:Voyage\s+Number|VOYAGE\s+NUMBER|Voyage|VOYAGE)[\s:]*([^\n]+)', text, re.IGNORECASE)
-        data['voyage_number'] = voyage_match.group(1).strip() if voyage_match else None
+        voyage_value = voyage_match.group(1).strip() if voyage_match else None
+        # "Voyage No: 26E15" — regex ловит метку 'Voyage' и прилипшее 'No:' снимаем
+        if voyage_value:
+            voyage_value = re.sub(r'^\s*No[.:\s]+', '', voyage_value, flags=re.IGNORECASE).strip()
+        data['voyage_number'] = voyage_value or None
         
         # Pro number
         pro_match = re.search(r'(?:Pro\s+Number|PRO\s+NUMBER|Pro number|PRO\s*#)[\s:]*([A-Z0-9\-]+)', text, re.IGNORECASE)
@@ -214,12 +222,21 @@ class DocumentExtractor:
         if packages_match:
             data['total_packages'] = int(packages_match.group(1))
         
-        # Общий вес
-        weight_match = re.search(r'(?:GRAND TOTAL.*?WEIGHT|Total\s+Weight)[\s:]*(\d+[\.,]?\d*)', text, re.IGNORECASE | re.DOTALL)
+        # Общий вес. Разделяем разделитель тысяч и дробную часть:
+        # "18,450" и "18 450" — это 18450, "18.45" — 18.45
+        weight_match = re.search(
+            r'(?:GRAND TOTAL.*?WEIGHT|Total\s+Weight)[\s:]*'
+            r'(\d{1,3}(?:[ ,]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)',
+            text, re.IGNORECASE | re.DOTALL)
         if weight_match and weight_match.group(1).strip():
             try:
-                data['weight'] = float(weight_match.group(1).replace(',', '.'))
-            except:
+                raw = weight_match.group(1).replace(' ', '')
+                if re.fullmatch(r'\d{1,3}(,\d{3})+', raw):
+                    raw = raw.replace(',', '')
+                else:
+                    raw = raw.replace(',', '.')
+                data['weight'] = float(raw)
+            except (ValueError, TypeError):
                 pass
         
         # Дата
@@ -411,12 +428,15 @@ class DocumentExtractor:
         if start_pos == -1:
             return None
         
-        # Ищем позицию конца
+        # Ищем позицию конца — по границе слова (\b), иначе 'Port' ловится
+        # внутри слов IMPORT / TRANSPORT / REPORT (баг обрезки Consignee)
         end_pos = len(text)
         for kw in end_keywords:
-            pos = text_upper.find(kw.upper(), start_pos)
-            if pos >= 0 and pos < end_pos:
-                end_pos = pos
+            m = re.search(r'\b' + re.escape(kw.upper()) + r'\b', text_upper[start_pos:])
+            if m:
+                pos = start_pos + m.start()
+                if pos < end_pos:
+                    end_pos = pos
         
         # Извлекаем и возвращаем раздел
         section = text[start_pos:end_pos]
