@@ -117,7 +117,9 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ── База данных ──
-WORK_BOT_DB = os.path.join(os.path.dirname(__file__), "work_bot.db")
+# Путь задают через WORK_BOT_DB, чтобы база жила в томе контейнера
+# (например /app/state/work_bot.db) и переживала пересборку образа.
+WORK_BOT_DB = os.environ.get("WORK_BOT_DB") or os.path.join(os.path.dirname(__file__), "work_bot.db")
 
 
 class WorkBotDB:
