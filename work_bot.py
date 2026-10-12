@@ -374,7 +374,7 @@ def get_main_keyboard():
         [
             [KeyboardButton("📄 Документ"), KeyboardButton("📷 Товар")],
             [KeyboardButton("🎤 Голос"), KeyboardButton("ℹ️ Помощь")],
-            [KeyboardButton("📚 База ВЭД")],
+            [KeyboardButton("📖 Мои документы"), KeyboardButton("📚 База ВЭД")],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -696,6 +696,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if text == "ℹ️ Помощь":
         await help_cmd(update, context)
+        return
+
+    if text == "📖 Мои документы":
+        await mydocs_cmd(update, context)
         return
 
     if text == "📚 База ВЭД":
